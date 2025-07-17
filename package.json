@@ -7,8 +7,9 @@
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "dev:backend": "python app.py",
     "dev:frontend": "cd frontend && vite",
-    "build": "./railway-build.sh",
-    "start": "gunicorn app:app"
+    "build": "cd frontend && npm install && npm run build",
+    "start": "gunicorn app:app",
+    "railway-build": "pip install -r requirements.txt && npm install && cd frontend && npm install && npm run build"
   },
   "dependencies": {
     "concurrently": "^7.6.0"
