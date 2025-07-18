@@ -1,11 +1,17 @@
 [phases.setup]
-nixPkgs = ["python311", "nodejs_18"]
+nixPkgs = ["python311", "nodejs_18", "gcc"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt", "cd frontend && npm install && cd .."]
+cmds = [
+    "pip install --upgrade pip",
+    "pip install -r requirements.txt",
+    "cd frontend && npm install && cd .."
+]
 
 [phases.build]
-cmds = ["cd frontend && npm run build && cd .."]
+cmds = [
+    "cd frontend && npm run build && cd .."
+]
 
 [start]
-cmd = "gunicorn app_modified:app --bind 0.0.0.0:$PORT" 
+cmd = "gunicorn app_modified:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120" 
