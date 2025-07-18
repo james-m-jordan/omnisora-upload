@@ -3,9 +3,18 @@
 ## 🎯 What I Fixed
 
 1. **Created `nixpacks.toml`** - Proper build configuration for Railway
-2. **Updated `Procfile`** - Added PORT binding and timeout settings
+   - Removed venv creation (Railway handles isolation)
+   - Use `npm --prefix frontend` for correct directory
+   - Added libffi and openssl for Python packages
+   - Direct pip install without venv activation
+
+2. **Updated `Procfile`** - Simplified to avoid conflicts with nixpacks
+
 3. **Created `railway.toml`** - Railway-specific deployment settings
-4. **Frontend Build** - Configured to build React app and copy to static folder
+
+4. **Added `build.sh`** - Backup build script if nixpacks fails
+
+5. **Updated `runtime.txt`** - Specific Python version (3.11.9)
 
 ## 📋 Steps to Deploy
 
