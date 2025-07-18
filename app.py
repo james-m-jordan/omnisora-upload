@@ -3,15 +3,13 @@ import hashlib
 import sqlite3
 import logging
 import re
-from flask import Flask, request, jsonify, render_template_string, render_template, Response, url_for, send_from_directory
+from flask import Flask, request, jsonify, render_template_string, render_template, Response, url_for
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from boto3.session import Session
 from dotenv import load_dotenv
 from io import BytesIO
 from datetime import datetime
-import openai
-import json
 
 # Configure logging
 logging.basicConfig(
@@ -19,35 +17,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Load environment variables
-load_dotenv()
-
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)
-
-# Configuration
-BUCKET_NAME = os.getenv('B2_BUCKET', 'my-uploads')
-CHUNK_SIZE = 100 * 1024 * 1024  # 100MB chunks
-UPLOAD_FOLDER = 'uploads'
-DATABASE = 'uploads.db'
-ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'doc', 'docx', 'xls', 'xlsx', 'zip', 'mp4', 'mov', 'avi'}
-
-# Initialize OpenAI client for AI tagging
-if os.getenv('OPENAI_API_KEY'):
-    from openai import OpenAI
-    openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-
-# Initialize B2 client
-session = Session()
-s3 = session.client(
-    service_name='s3',
-    endpoint_url=os.getenv('B2_ENDPOINT'),
-    aws_access_key_id=os.getenv('B2_KEY_ID'),
-    aws_secret_access_key=os.getenv('B2_APPLICATION_KEY'),
-    config=None
-)
 
 # Helper functions
 def format_file_size(size_bytes):
@@ -74,36 +43,6 @@ def calculate_file_hash_chunked(file_obj, chunk_size=8192):
     
     file_obj.seek(0)  # Reset file pointer
     return hasher.hexdigest()
-
-def generate_ai_tags(description, filename):
-    """Generate AI tags based on file description and name."""
-    if not os.getenv('OPENAI_API_KEY') or not description:
-        return []
-    
-    try:
-        prompt = f"""Given this file description and filename, generate 5-8 relevant tags that would help categorize and find this file later.
-
-Filename: {filename}
-Description: {description}
-
-Return only the tags as a JSON array of strings, nothing else."""
-
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that generates relevant tags for files."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=100
-        )
-        
-        tags_text = response.choices[0].message.content.strip()
-        tags = json.loads(tags_text)
-        return tags[:8]  # Limit to 8 tags
-    except Exception as e:
-        logger.error(f"Error generating AI tags: {e}")
-        return []
 
 def upload_large_file_multipart(file_obj, bucket, key, file_size):
     """Upload large files using B2's multipart upload API."""
@@ -166,255 +105,430 @@ def upload_large_file_multipart(file_obj, bucket, key, file_size):
         return True
         
     except Exception as e:
-        logger.error(f"Multipart upload error: {e}")
-        # Abort the upload if it fails
+        logger.error(f"Multipart upload failed: {e}")
+        
+        # Try to abort the upload
         try:
             s3.abort_multipart_upload(
                 Bucket=bucket,
                 Key=key,
                 UploadId=upload_id
             )
+            logger.info(f"Aborted multipart upload: {upload_id}")
         except:
             pass
+            
         raise e
 
+# Load environment variables
+load_dotenv()
+B2_KEY_ID = os.getenv('B2_KEY_ID')
+B2_APPLICATION_KEY = os.getenv('B2_APPLICATION_KEY')
+B2_BUCKET = os.getenv('B2_BUCKET')
+B2_ENDPOINT = os.getenv('B2_ENDPOINT')
+
+# Validate required environment variables
+required_vars = {
+    'B2_KEY_ID': B2_KEY_ID,
+    'B2_APPLICATION_KEY': B2_APPLICATION_KEY,
+    'B2_BUCKET': B2_BUCKET,
+    'B2_ENDPOINT': B2_ENDPOINT
+}
+
+missing_vars = [var for var, value in required_vars.items() if not value]
+if missing_vars:
+    logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+    logger.error("Please set all required environment variables in .env or system environment")
+    exit(1)
+
+logger.info("Environment variables loaded successfully")
+
+# SQLite setup
+DB_PATH = 'metadata.db'
 def init_db():
-    """Initialize the database."""
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS uploads
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  hash TEXT UNIQUE NOT NULL,
-                  filename TEXT NOT NULL,
-                  size INTEGER,
-                  upload_date TEXT NOT NULL,
-                  content_type TEXT,
-                  description TEXT,
-                  tags TEXT,
-                  b2_file_id TEXT)''')
-    conn.commit()
-    conn.close()
+    """Initialize the database with all necessary columns."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Create table with all columns we need
+        c.execute('''CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            original_filename TEXT,
+            filehash TEXT NOT NULL,
+            file_size INTEGER,
+            mime_type TEXT,
+            url TEXT NOT NULL,
+            upload_ip TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            download_count INTEGER DEFAULT 0
+        )''')
+        
+        # Create index for faster hash lookups
+        c.execute('CREATE INDEX IF NOT EXISTS idx_filehash ON files(filehash)')
+        
+        # Check if we need to add columns for existing databases
+        c.execute("PRAGMA table_info(files)")
+        existing_columns = [column[1] for column in c.fetchall()]
+        
+        # Add missing columns
+        columns_to_add = [
+            ('original_filename', 'TEXT'),
+            ('file_size', 'INTEGER'),
+            ('mime_type', 'TEXT'),
+            ('upload_ip', 'TEXT'),
+            ('download_count', 'INTEGER DEFAULT 0')
+        ]
+        
+        for col_name, col_type in columns_to_add:
+            if col_name not in existing_columns:
+                c.execute(f'ALTER TABLE files ADD COLUMN {col_name} {col_type}')
+                logger.info(f"Added {col_name} column to existing database")
+        
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        raise
 
-def save_file_metadata(file_hash, filename, size, content_type, description=None, tags=None, b2_file_id=None):
-    """Save file metadata to database."""
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    
-    # Convert tags list to JSON string
-    tags_json = json.dumps(tags) if tags else '[]'
-    
-    c.execute('''INSERT OR REPLACE INTO uploads 
-                 (hash, filename, size, upload_date, content_type, description, tags, b2_file_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-              (file_hash, filename, size, datetime.now().isoformat(), content_type, description, tags_json, b2_file_id))
-    conn.commit()
-    conn.close()
+init_db()
 
-def get_file_metadata(file_hash):
-    """Get file metadata from database."""
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute('SELECT * FROM uploads WHERE hash = ?', (file_hash,))
-    row = c.fetchone()
-    conn.close()
-    
-    if row:
-        return {
-            'id': row[0],
-            'hash': row[1],
-            'filename': row[2],
-            'size': row[3],
-            'upload_date': row[4],
-            'content_type': row[5],
-            'description': row[6],
-            'tags': json.loads(row[7]) if row[7] else [],
-            'b2_file_id': row[8]
-        }
-    return None
+# Boto3 S3 client
+session = Session()
+s3 = session.client(
+    service_name='s3',
+    aws_access_key_id=B2_KEY_ID,
+    aws_secret_access_key=B2_APPLICATION_KEY,
+    endpoint_url=B2_ENDPOINT
+)
 
-def get_recent_uploads(limit=10):
-    """Get recent uploads from database."""
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute('''SELECT hash, filename, size, upload_date, description, tags 
-                 FROM uploads 
-                 ORDER BY upload_date DESC 
-                 LIMIT ?''', (limit,))
-    rows = c.fetchall()
-    conn.close()
-    
-    uploads = []
-    for row in rows:
-        uploads.append({
-            'hash': row[0],
-            'filename': row[1],
-            'size': row[2],
-            'upload_date': row[3],
-            'description': row[4],
-            'tags': json.loads(row[5]) if row[5] else []
-        })
-    return uploads
+app = Flask(__name__)
+
+# Enable CORS for API usage
+CORS(app, origins=["*"], allow_headers=["Content-Type"])
+
+# Configure upload limits - removed artificial limit, let B2 handle it
+# B2 supports files up to 10TB, with parts from 5MB to 5GB
+app.config['MAX_CONTENT_LENGTH'] = None  # No limit, we'll stream large files
+app.config['UPLOAD_FOLDER'] = '/tmp'  # Temporary storage if needed
+
+# Additional configuration for large file handling
+app.config['MAX_CONTENT_PATH'] = None
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+
+# Enable request streaming for large files
+class StreamConsumingMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        # For uploads, don't buffer the entire request
+        if environ.get('REQUEST_METHOD') == 'POST' and '/upload' in environ.get('PATH_INFO', ''):
+            environ['wsgi.input_terminated'] = True
+        return self.app(environ, start_response)
+
+# Apply streaming middleware
+app.wsgi_app = StreamConsumingMiddleware(app.wsgi_app)
+
+# B2 multipart upload configuration
+CHUNK_SIZE = 100 * 1024 * 1024  # 100MB chunks for multipart uploads
+MIN_MULTIPART_SIZE = 100 * 1024 * 1024  # Use multipart for files > 100MB
+
+# Error handler for file too large - removed since we have no limit
+# @app.errorhandler(413)
+# def request_entity_too_large(error):
+#     return jsonify({'error': 'File too large. Maximum size is 100MB'}), 413
 
 @app.route('/')
 def index():
-    """Serve the main upload interface."""
-    # In production, serve the built React app
-    if os.path.exists('frontend/dist/index.html'):
-        return send_from_directory('frontend/dist', 'index.html')
-    # In development, redirect to Vite dev server
     return render_template('index.html')
 
-@app.route('/<path:path>')
-def serve_static(path):
-    """Serve static files from the React build."""
-    if os.path.exists(f'frontend/dist/{path}'):
-        return send_from_directory('frontend/dist', path)
-    # Fallback to index.html for client-side routing
-    return send_from_directory('frontend/dist', 'index.html')
-
-@app.route('/api/upload', methods=['POST'])
-def upload_file():
-    """Handle file upload with AI tagging."""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    
-    file = request.files['file']
-    description = request.form.get('description', '')
-    
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    # Read file into memory
-    file_data = BytesIO(file.read())
-    file_size = file_data.tell()
-    file_data.seek(0)
-    
-    # Calculate hash
-    file_hash = calculate_file_hash_chunked(file_data)
-    logger.info(f"File hash: {file_hash}, Size: {format_file_size(file_size)}")
-    
-    # Check if file already exists
-    existing = get_file_metadata(file_hash)
-    if existing:
-        return jsonify({
-            'success': True,
-            'hash': file_hash,
-            'filename': existing['filename'],
-            'size': format_file_size(existing['size']),
-            'tags': existing['tags'],
-            'message': 'File already exists',
-            'shareUrl': f"/f/{file_hash[:8]}"
-        })
-    
-    # Generate AI tags
-    tags = generate_ai_tags(description, file.filename)
-    
-    # Upload to B2
+@app.route('/health')
+def health_check():
+    """Health check endpoint for monitoring."""
     try:
-        key = f"{file_hash}/{secure_filename(file.filename)}"
+        # Check database connection
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM files')
+        file_count = c.fetchone()[0]
+        conn.close()
         
-        if file_size > CHUNK_SIZE:
+        # Check B2 connection
+        s3.list_buckets()
+        
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'file_count': file_count,
+            'version': '2.5.0'  # Large file support version
+        }), 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 503
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part'}), 400
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'}), 400
+        
+        # Sanitize filename for security
+        safe_filename = secure_filename(file.filename)
+        if not safe_filename:
+            safe_filename = 'unnamed_file'
+        
+        # Check file size before reading
+        file.seek(0, 2)  # Seek to end
+        file_size = file.tell()
+        file.seek(0)  # Reset to beginning
+        
+        logger.info(f"Upload attempt: {safe_filename} ({format_file_size(file_size)})")
+        
+        # Validate file size
+        if file_size == 0:
+            return jsonify({'error': 'File is empty'}), 400
+        
+        # Get file metadata
+        mime_type = file.mimetype
+        original_filename = safe_filename
+        upload_ip = request.remote_addr or 'unknown'
+        
+        # Calculate hash using chunked reading (memory efficient)
+        logger.info(f"Calculating hash for {safe_filename}")
+        filehash = calculate_file_hash_chunked(file)
+        
+        # Create S3 key with hash prefix and sanitized filename
+        s3_key = f"{filehash[:8]}_{safe_filename}"
+        
+        logger.info(f"Uploading to B2: {s3_key} (size: {format_file_size(file_size)})")
+        
+        # Choose upload method based on file size
+        if file_size > MIN_MULTIPART_SIZE:
             # Use multipart upload for large files
-            logger.info(f"Using multipart upload for large file: {format_file_size(file_size)}")
-            upload_large_file_multipart(file_data, BUCKET_NAME, key, file_size)
+            logger.info(f"Using multipart upload for large file ({format_file_size(file_size)})")
+            upload_large_file_multipart(file, B2_BUCKET, s3_key, file_size)
         else:
-            # Use simple upload for smaller files
-            s3.put_object(
-                Bucket=BUCKET_NAME,
-                Key=key,
-                Body=file_data.getvalue(),
-                ContentType=file.content_type or 'application/octet-stream'
+            # Use regular upload for smaller files
+            logger.info(f"Using regular upload for file ({format_file_size(file_size)})")
+            file.seek(0)  # Reset to beginning
+            s3.upload_fileobj(
+                Fileobj=file,
+                Bucket=B2_BUCKET,
+                Key=s3_key
             )
         
-        # Save metadata
-        save_file_metadata(
-            file_hash,
-            file.filename,
-            file_size,
-            file.content_type,
-            description,
-            tags
-        )
+        logger.info(f"B2 upload successful: {s3_key}")
+        
+        # Construct public URL - using the correct B2 format
+        # For B2, the public URL format is: https://fNNN.backblazeb2.com/file/BUCKET_NAME/KEY
+        # Extract the file number from endpoint (e.g., f005 from s3.us-east-005.backblazeb2.com)
+        if B2_ENDPOINT:
+            match = re.search(r's3\.(.+?)\.backblazeb2\.com', B2_ENDPOINT)
+            if match:
+                region = match.group(1)
+                # Convert us-east-005 to f005 (keep the leading zeros!)
+                file_num = 'f' + region.split('-')[-1]
+                url = f"https://{file_num}.backblazeb2.com/file/{B2_BUCKET}/{s3_key}"
+            else:
+                # Fallback to constructed URL
+                url = f"{B2_ENDPOINT}/{B2_BUCKET}/{s3_key}"
+        else:
+            url = f"https://f005.backblazeb2.com/file/{B2_BUCKET}/{s3_key}"
+        
+        # Store metadata
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''INSERT INTO files 
+                    (filename, original_filename, filehash, file_size, mime_type, url, upload_ip) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                  (s3_key, original_filename, filehash, file_size, mime_type, url, upload_ip))
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"File uploaded successfully: {original_filename} ({format_file_size(file_size)}) - Hash: {filehash[:8]}")
         
         return jsonify({
-            'success': True,
-            'hash': file_hash,
-            'filename': file.filename,
+            'filename': original_filename, 
+            'hash': filehash,
+            'hash_short': filehash[:8],
             'size': format_file_size(file_size),
-            'tags': tags,
-            'shareUrl': f"/f/{file_hash[:8]}"
+            'url': url,
+            'info_url': f"/f/{filehash[:8]}"
         })
-        
     except Exception as e:
-        logger.error(f"Upload error: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Upload failed for {safe_filename if 'safe_filename' in locals() else 'unknown'}: {str(e)}")
+        logger.exception("Full traceback:")
+        return jsonify({'error': f'Upload failed: {str(e)}'}), 500
+
+@app.route('/files')
+def list_files():
+    """List recent files with full metadata."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''SELECT filename, original_filename, filehash, file_size, 
+                            mime_type, created_at, download_count 
+                     FROM files 
+                     ORDER BY created_at DESC 
+                     LIMIT 50''')
+        
+        files = []
+        for row in c.fetchall():
+            files.append({
+                'filename': row[0],
+                'original_filename': row[1] or row[0],
+                'hash': row[2],
+                'hash_short': row[2][:8] if row[2] else '',
+                'size': format_file_size(row[3]) if row[3] else 'Unknown',
+                'mime_type': row[4] or 'application/octet-stream',
+                'created_at': row[5],
+                'download_count': row[6] or 0,
+                'info_url': f"/f/{row[2][:8]}" if row[2] else ''
+            })
+        
+        conn.close()
+        
+        # Check if this is an API request (Accept: application/json)
+        if request.headers.get('Accept') == 'application/json' or request.path.endswith('.json'):
+            response = jsonify({
+                'files': files,
+                'count': len(files),
+                'limit': 50
+            })
+            
+            # Add rate limit headers (informational)
+            response.headers['X-RateLimit-Limit'] = '1000'
+            response.headers['X-RateLimit-Remaining'] = '999'
+            response.headers['X-RateLimit-Reset'] = str(int(datetime.utcnow().timestamp()) + 3600)
+            
+            return response
+        else:
+            # Return HTML template for browser requests
+            return render_template('files.html', files=files)
+            
+    except Exception as e:
+        logger.error(f"Error listing files: {e}")
+        if request.headers.get('Accept') == 'application/json':
+            return jsonify({'error': 'Failed to list files'}), 500
+        else:
+            return render_template('files.html', files=[], error='Failed to load files')
 
 @app.route('/f/<hash_prefix>')
-def file_page(hash_prefix):
-    """Display file information and download link."""
-    # Find file by hash prefix
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute('SELECT * FROM uploads WHERE hash LIKE ?', (hash_prefix + '%',))
-    row = c.fetchone()
-    conn.close()
-    
-    if not row:
-        return "File not found", 404
-    
-    file_info = {
-        'hash': row[1],
-        'filename': row[2],
-        'size': format_file_size(row[3]),
-        'upload_date': row[4],
-        'content_type': row[5],
-        'description': row[6],
-        'tags': json.loads(row[7]) if row[7] else []
-    }
-    
-    return render_template('file_view.html', file=file_info)
-
-@app.route('/download/<file_hash>')
-def download_file(file_hash):
-    """Generate presigned URL for file download."""
-    metadata = get_file_metadata(file_hash)
-    if not metadata:
-        return "File not found", 404
+def get_file_by_hash(hash_prefix):
+    """Retrieve file by hash prefix (minimum 8 characters)."""
+    if len(hash_prefix) < 8:
+        return jsonify({'error': 'Hash prefix must be at least 8 characters'}), 400
     
     try:
-        key = f"{file_hash}/{metadata['filename']}"
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
         
-        # Generate presigned URL
-        url = s3.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': BUCKET_NAME, 'Key': key},
-            ExpiresIn=3600  # 1 hour
-        )
+        # Find files matching the hash prefix
+        c.execute('''SELECT filename, original_filename, filehash, file_size, mime_type, url, created_at 
+                    FROM files WHERE filehash LIKE ? ORDER BY created_at DESC''', 
+                    (hash_prefix + '%',))
         
-        return jsonify({
-            'success': True,
-            'download_url': url,
-            'filename': metadata['filename']
-        })
+        results = c.fetchall()
+        
+        if not results:
+            conn.close()
+            return render_template('file_not_found.html', hash_prefix=hash_prefix)
+        
+        if len(results) == 1:
+            # Single match - show file info page
+            file_data = results[0]
+            
+            # Increment download count
+            c.execute('UPDATE files SET download_count = download_count + 1 WHERE filehash = ?', 
+                     (file_data[2],))
+            conn.commit()
+            
+            # Get updated download count
+            c.execute('SELECT download_count FROM files WHERE filehash = ?', (file_data[2],))
+            download_count = c.fetchone()[0] or 0
+            
+            conn.close()
+            
+            return render_template('file_info.html', 
+                filename=file_data[0],
+                original_filename=file_data[1],
+                filehash=file_data[2],
+                file_size=format_file_size(file_data[3]) if file_data[3] else 'Unknown',
+                mime_type=file_data[4],
+                url=file_data[5],
+                created_at=file_data[6],
+                download_count=download_count,
+                request=request
+            )
+        else:
+            # Multiple matches - show disambiguation page
+            conn.close()
+            return render_template('disambiguation.html', hash_prefix=hash_prefix, files=results)
+            
+    except Exception as e:
+        logger.error(f"Error retrieving file by hash: {e}")
+        return jsonify({'error': 'Failed to retrieve file'}), 500
+
+@app.route('/search')
+def search_files():
+    """Search for files by filename or hash."""
+    query = request.args.get('q', '').strip()
+    
+    if not query:
+        return render_template('search.html', query='', results=[], total=0)
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Search in both filename and hash
+        search_pattern = f'%{query}%'
+        c.execute('''SELECT filename, original_filename, filehash, file_size, url, created_at, download_count
+                    FROM files 
+                    WHERE original_filename LIKE ? OR filehash LIKE ? OR filename LIKE ?
+                    ORDER BY created_at DESC
+                    LIMIT 50''', 
+                    (search_pattern, search_pattern, search_pattern))
+        
+        results = [{
+            'filename': row[0],
+            'original_filename': row[1] or row[0],
+            'hash': row[2],
+            'hash_short': row[2][:8] if row[2] else '',
+            'file_size': format_file_size(row[3]) if row[3] else 'Unknown',
+            'url': row[4],
+            'created_at': row[5],
+            'download_count': row[6] or 0
+        } for row in c.fetchall()]
+        
+        conn.close()
+        
+        return render_template('search.html', 
+                             query=query, 
+                             results=results, 
+                             total=len(results))
         
     except Exception as e:
-        logger.error(f"Download error: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Search error: {e}")
+        return render_template('search.html', 
+                             query=query, 
+                             results=[], 
+                             total=0,
+                             error='Search failed. Please try again.')
 
-@app.route('/api/recent')
-def recent_uploads():
-    """Get recent uploads."""
-    uploads = get_recent_uploads(20)
-    return jsonify(uploads)
 
-@app.route('/health')
-def health():
-    """Health check endpoint."""
-    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
-
-# Initialize database on startup
-init_db()
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # Never run with debug=True in production!
+    # Use gunicorn or another production WSGI server
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000))) 
