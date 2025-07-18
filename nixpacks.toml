@@ -1,16 +1,11 @@
-# nixpacks.toml
 [phases.setup]
-nixPkgs = ["python311", "nodejs_18", "gcc", "libffi", "openssl"]
+nixPkgs = ["python311", "nodejs-18_x", "gcc"]
 
 [phases.install]
 cmds = [
-    "pip install --upgrade pip setuptools wheel",
     "pip install -r requirements.txt",
-    "npm --prefix frontend install",
-    "npm --prefix frontend run build",
-    "mkdir -p static",
-    "cp -r frontend/dist/* static/ || echo 'No dist files to copy yet'"
+    "cd frontend && npm install && npm run build && cd .."
 ]
 
 [start]
-cmd = "gunicorn app_simple:app --bind 0.0.0.0:$PORT --timeout 120"
+cmd = "gunicorn app_simple:app"
