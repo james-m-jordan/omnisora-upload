@@ -1,20 +1,9 @@
 {
   "name": "omnisora-upload",
   "version": "1.0.0",
-  "description": "Unified file upload system with AI tagging and 10TB support",
-  "private": true,
+  "description": "Frontend build for OmniSora",
   "scripts": {
-    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "dev:backend": "python app.py",
-    "dev:frontend": "cd frontend && vite",
     "build": "cd frontend && npm install && npm run build",
-    "start": "gunicorn app:app"
-  },
-  "dependencies": {
-    "concurrently": "^7.6.0"
-  },
-  "engines": {
-    "node": ">=16.0.0",
-    "npm": ">=7.0.0"
+    "start": "echo 'Use gunicorn to start the Flask backend'"
   }
 }
