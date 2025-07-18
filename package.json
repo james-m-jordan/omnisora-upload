@@ -7,8 +7,8 @@
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "dev:backend": "python app.py",
     "dev:frontend": "cd frontend && vite",
-    "build": "echo 'Build handled by nixpacks.toml'",
-    "start": "echo 'Start handled by nixpacks.toml'"
+    "build": "cd frontend && npm install && npm run build",
+    "start": "gunicorn app:app"
   },
   "dependencies": {
     "concurrently": "^7.6.0"
