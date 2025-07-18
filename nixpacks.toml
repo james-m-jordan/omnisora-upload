@@ -1,10 +1,9 @@
 [phases.setup]
-nixPkgs = ["python311", "nodejs_18", "gcc"]
+nixPkgs = ["python311", "nodejs_18"]
 
 [phases.install]
 cmds = [
-    "pip install --upgrade pip",
-    "pip install -r requirements.txt",
+    "pip install flask flask-cors boto3 gunicorn python-dotenv",
     "cd frontend && npm install && cd .."
 ]
 
@@ -14,4 +13,4 @@ cmds = [
 ]
 
 [start]
-cmd = "gunicorn app_modified:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120" 
+cmd = "gunicorn app_simple:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120" 
