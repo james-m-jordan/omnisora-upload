@@ -1,9 +1,9 @@
 [phases.setup]
-nixPkgs = ["python311", "nodejs_18"]
+nixPkgs = ["python311", "python311Packages.pip", "nodejs_18"]
 
 [phases.install]
 cmds = [
-    "pip install flask flask-cors boto3 gunicorn python-dotenv",
+    "python -m pip install flask flask-cors boto3 gunicorn python-dotenv",
     "cd frontend && npm install && cd .."
 ]
 
