@@ -1,1 +1,1 @@
-web: cd frontend && npm install && npm run build && cd .. && mkdir -p static && cp -r frontend/dist/* static/ && gunicorn app_simple:app --bind 0.0.0.0:$PORT
+web: python app_simple.py
